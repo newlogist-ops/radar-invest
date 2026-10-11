@@ -1,0 +1,105 @@
+name: Verificar oportunidades
+
+on:
+  schedule:
+    # 10h–17h de Brasília (UTC-3), de segunda a sexta.
+    - cron: "0 13-20 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      test_connections:
+        description: "Testar Brapi e enviar mensagem de confirmação ao Discord"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: investment-alerts
+  cancel-in-progress: false
+
+jobs:
+  check-prices:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar arquivos
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Preparar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Testar conexão com Brapi e Discord
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_connections }}
+        env:
+          BRAPI_TOKEN: ${{ secrets.BRAPI_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          node --input-type=module <<'NODE'
+          const token = process.env.BRAPI_TOKEN;
+          const webhook = process.env.DISCORD_WEBHOOK_URL;
+          if (!token) throw new Error('Secret BRAPI_TOKEN não configurado.');
+          if (!webhook) throw new Error('Secret DISCORD_WEBHOOK_URL não configurado.');
+
+          const url = new URL('https://brapi.dev/api/quote/MXRF11');
+          url.searchParams.set('range', '3mo');
+          url.searchParams.set('interval', '1d');
+          const marketResponse = await fetch(url, {
+            headers: { Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(20000)
+          });
+          if (!marketResponse.ok) {
+            throw new Error(`Brapi respondeu HTTP ${marketResponse.status}. Confira o token e o acesso a MXRF11.`);
+          }
+          const payload = await marketResponse.json();
+          const quote = payload.results?.[0];
+          const price = Number(quote?.regularMarketPrice);
+          const historyCount = quote?.historicalDataPrice?.length || 0;
+          if (!Number.isFinite(price) || historyCount < 2) {
+            throw new Error('A Brapi respondeu, mas não trouxe cotação e histórico suficientes para MXRF11.');
+          }
+
+          const formattedPrice = new Intl.NumberFormat('pt-BR', {
+            style: 'currency', currency: 'BRL'
+          }).format(price);
+          const discordResponse = await fetch(webhook, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              username: 'Radar de Investimentos',
+              content: `✅ **Teste do Radar concluído!**\nAPI de preços conectada para MXRF11 (${formattedPrice}) e histórico recebido (${historyCount} pontos). O webhook do Discord também está funcionando. Este é só um teste, não um alerta de compra.`
+            }),
+            signal: AbortSignal.timeout(20000)
+          });
+          if (!discordResponse.ok) {
+            throw new Error(`Discord respondeu HTTP ${discordResponse.status}. Confira DISCORD_WEBHOOK_URL.`);
+          }
+          console.log('Teste concluído; nenhum token foi exibido.');
+          NODE
+
+      - name: Verificar preços e publicar alertas
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.test_connections }}
+        run: node check.mjs
+        env:
+          BRAPI_TOKEN: ${{ secrets.BRAPI_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          AVG_SESSIONS: "60"
+          ALERT_STEP_PERCENT: "1"
+          TIMEZONE: America/Sao_Paulo
+
+      - name: Salvar controle antirrepetição
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.test_connections }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/state.json
+          if git diff --cached --quiet; then
+            echo "Estado sem alterações."
+          else
+            git commit -m "Atualiza controle de alertas"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
